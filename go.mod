@@ -110,7 +110,7 @@ require (
 	honnef.co/go/tools v0.8.0-rc.1 // indirect
 )
 
-// Local development: this branch needs DERPDialer support from the
-// tailscale fork (see ea/derp-dialer). Drop this replace once the
-// corresponding change lands upstream.
-replace tailscale.com => ../tailscale
+// This branch needs DERPDialer support from the tailscale fork, pinned to the
+// commit on its easyss/derp-dialer branch. Drop this replace (and go back to
+// the upstream version above) once that change lands in tailscale.
+replace tailscale.com => github.com/nange/tailscale v0.0.0-20261007134803-8452f30bcc38
