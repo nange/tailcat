@@ -54,6 +54,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -77,6 +78,7 @@ import (
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/netx"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
@@ -343,6 +345,8 @@ type locoBackend struct {
 	serverDiscoPub key.DiscoPublic // non-zero if we're a client (server's disco key)
 	presharedKey   PresharedKey
 	isServer       bool
+	derpDialer     netx.DialFunc // or nil, see Server.DERPDialer
+	derpOnly       bool          // see Server.DERPOnly
 
 	// discoPublic returns the node's disco public key, memoized to
 	// avoid redoing the curve25519 derivation for every client that
@@ -448,6 +452,20 @@ type Server struct {
 	// clients are allowed. See [Server.AddAllowedClient] to add more
 	// at runtime.
 	AllowedClients []key.NodePublic
+
+	// DERPDialer, if non-nil, is used to establish the TCP connection to
+	// the DERP relay this server is reachable through, instead of the
+	// default dialer. Use it to run the relay connection over a custom
+	// transport (for example an application's own tunnel to the relay);
+	// nil keeps the default behavior. It must be set before Start.
+	DERPDialer netx.DialFunc
+
+	// DERPOnly, if true, disables direct (UDP) paths entirely: peers are
+	// then reached only through the DERP relay. It is applied process-wide
+	// when the WireGuard engine is created (see createEngine) because
+	// magicsock reads it while creating its sockets, so it cannot be
+	// changed per connection and it must be set before Start.
+	DERPOnly bool
 
 	lb *locoBackend // non-nil once Start has been called
 
@@ -614,6 +632,8 @@ func (s *Server) startLocked(ctx context.Context) error {
 	}
 
 	lb := newLocoBackend(priv, psk)
+	lb.derpDialer = s.DERPDialer
+	lb.derpOnly = s.DERPOnly
 	lb.logf = logf
 	lb.dm = &tailcfg.DERPMap{}
 	mak.Set(&lb.dm.Regions, reg.RegionID, reg)
@@ -1009,6 +1029,12 @@ func newLocoBackend(priv key.NodePrivate, psk PresharedKey) *locoBackend {
 }
 
 var debugAddr = envknob.Bool("TS_DEBUG_ADDR")
+
+// derpOnlyEnvKnob is the tailscale debug knob that makes magicsock skip its
+// UDP sockets entirely, leaving the DERP relay as the only way out. It is
+// process-wide and read when a socket is created, hence the ordering in
+// createEngine.
+const derpOnlyEnvKnob = "TS_DEBUG_ALWAYS_USE_DERP"
 
 func (lb *locoBackend) tailcatAddr() Addr {
 	if lb.dm == nil {
@@ -1802,6 +1828,13 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	// call-me-maybe messages that advertise our UDP endpoints (see
 	// locoBackend.advertiseEndpoints).
 	conf.ForceDiscoKey = discoPrivateForNode(lb.priv)
+	conf.DERPDialer = lb.derpDialer
+	// DERP-only has to be applied before the engine (and therefore magicsock)
+	// starts: magicsock reads this knob while creating its UDP sockets and
+	// skips them entirely when it is set. It is process-wide, so a later
+	// session overwrites it for the whole process — which is what callers
+	// flipping the setting between sessions want.
+	envknob.Setenv(derpOnlyEnvKnob, strconv.FormatBool(lb.derpOnly))
 	netns.SetEnabled(false)
 	e, err := wgengine.NewUserspaceEngine(logf, conf)
 	if err != nil {
@@ -1844,6 +1877,17 @@ type Client struct {
 	// process-wide in-memory cache is used. If set, it must be set
 	// before the client's first use.
 	DERPMapCache DERPMapCache
+
+	// DERPDialer, if non-nil, is used to establish the TCP connection to
+	// the DERP relay instead of the default dialer. See
+	// [Server.DERPDialer]. If set, it must be set before the client's
+	// first use.
+	DERPDialer netx.DialFunc
+
+	// DERPOnly, if true, disables direct (UDP) paths entirely: the server
+	// is then reached only through the DERP relay. See [Server.DERPOnly].
+	// If set, it must be set before the client's first use.
+	DERPOnly bool
 
 	lb       *locoBackend
 	ci       ConnInfo      // of server
@@ -1901,6 +1945,8 @@ func (c *Client) initLocked() error {
 	}
 	lb := newLocoBackend(c.nodeKeyLocked(), ci.PresharedKey)
 	lb.logf = logf
+	lb.derpDialer = c.DERPDialer
+	lb.derpOnly = c.DERPOnly
 	lb.dm = &tailcfg.DERPMap{}
 	lb.serverPub = ci.ServerPublic.NodePublic
 	lb.serverDiscoPub = ci.ServerDiscoPublic.DiscoPublic

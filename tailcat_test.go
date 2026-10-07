@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netx"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
@@ -1411,5 +1412,79 @@ func TestParseAddrRawKeepsNulls(t *testing.T) {
 	}
 	if len(w.Region) != 1 || w.Region[0] != nil {
 		t.Errorf("Region = %v; want a single nil element", w.Region)
+	}
+}
+
+// TestClientCarriesDERPOptions verifies that the client's DERP options reach
+// the backend that creates the WireGuard engine, i.e. that they are not
+// silently dropped before reaching magicsock.
+func TestClientCarriesDERPOptions(t *testing.T) {
+	priv := key.NewNode()
+	addr := (&ConnInfo{
+		ServerPublic:      NodePublic{priv.Public()},
+		ServerDiscoPublic: DiscoPublicForNode(priv),
+		RegionID:          10,
+	}).Addr()
+
+	dialer := netx.DialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("not used by this test")
+	})
+	c := NewClient(addr)
+	c.DERPDialer = dialer
+	c.DERPOnly = true
+	c.startMu.Lock()
+	err := c.initLocked()
+	c.startMu.Unlock()
+	if err != nil {
+		t.Fatalf("initLocked: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	if c.lb.derpDialer == nil {
+		t.Error("DERPDialer did not reach the backend")
+	}
+	if !c.lb.derpOnly {
+		t.Error("DERPOnly did not reach the backend")
+	}
+}
+
+// TestServerCarriesDERPOptions is the server-side counterpart: Start must hand
+// both options to the backend and apply DERP-only before the engine (and thus
+// magicsock) is created.
+func TestServerCarriesDERPOptions(t *testing.T) {
+	t.Cleanup(func() { envknob.Setenv(derpOnlyEnvKnob, "false") })
+
+	dialer := netx.DialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("no relay in this test")
+	})
+	s := &Server{
+		// An unreachable relay keeps the test offline: the engine is created
+		// without waiting for DERP (connections are made in the background).
+		Region: &tailcfg.DERPRegion{
+			RegionID:   1,
+			RegionCode: "test",
+			Nodes: []*tailcfg.DERPNode{{
+				Name:     "test",
+				RegionID: 1,
+				HostName: "derp.invalid",
+				DERPPort: 443,
+			}},
+		},
+		DERPDialer: dialer,
+		DERPOnly:   true,
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if s.lb.derpDialer == nil {
+		t.Error("DERPDialer did not reach the backend")
+	}
+	if !s.lb.derpOnly {
+		t.Error("DERPOnly did not reach the backend")
+	}
+	if !envknob.Bool(derpOnlyEnvKnob) {
+		t.Errorf("%s was not applied before the engine was created", derpOnlyEnvKnob)
 	}
 }

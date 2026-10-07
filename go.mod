@@ -109,3 +109,8 @@ require (
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	honnef.co/go/tools v0.8.0-rc.1 // indirect
 )
+
+// Local development: this branch needs DERPDialer support from the
+// tailscale fork (see ea/derp-dialer). Drop this replace once the
+// corresponding change lands upstream.
+replace tailscale.com => ../tailscale
